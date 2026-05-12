@@ -1,0 +1,10 @@
+[project]
+name = "checkokdp"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "pandas>=3.0.2",
+    "pyside6>=6.11.0",
+    "openpyxl>=3.1",
+]
