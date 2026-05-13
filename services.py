@@ -3,10 +3,14 @@
 Модуль, содержащий вспомогательные функции для работы с Excel‑файлами.
 """
 
+import io
+import os
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Callable, Dict, List, Tuple
 
 import pandas as pd
-from typing import Dict, List, Tuple
 
 # Текст в ячейке «Объединенный», если код в реестре не найден (суффикс к коду).
 REGISTRY_MISSING_SUFFIX = " — код в реестре ОКПД2 отсутствует"
@@ -22,76 +26,244 @@ def _coerce_header(val: object) -> str:
     return " ".join(str(val).replace("\u00a0", " ").split()).strip()
 
 
-def _engines_to_try(path: str) -> list[str | None]:
-    """
-    Порядок движков чтения: сначала типичный для расширения, затем запасной.
-    calamine (Rust) часто открывает старые .xls/.xlsx, с которыми xlrd/openpyxl падают.
-    """
-    ext = Path(path).suffix.lower()
-    seq: list[str | None]
-    if ext == ".xls":
-        seq = ["xlrd", "calamine"]
-    elif ext == ".xlsb":
-        seq = ["calamine"]
-    elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
-        seq = [None, "openpyxl", "calamine"]
-    else:
-        seq = [None, "openpyxl", "calamine", "xlrd"]
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
+
+def _peek_file_head(path: str, nbytes: int = 16384) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(nbytes)
+
+
+def sniff_excel_container(path: str) -> str:
+    """
+    Определение контейнера по байтам: расширение часто не совпадает с реальным форматом
+    (например «.xls», который на самом деле ZIP/xlsx, или HTML-выгрузка).
+    """
+    try:
+        blob = _peek_file_head(path)
+    except OSError:
+        return "unknown"
+    if not blob:
+        return "empty"
+    if blob[:4] == b"PK\x03\x04" or blob[:2] == b"PK":
+        return "zip_ooxml"
+    if blob[:8] == OLE_MAGIC:
+        return "ole_biff"
+    stripped = blob.lstrip()
+    if stripped.startswith(b"<?xml") or b":Workbook" in blob[:8000] or b"<ss:Workbook" in blob[:8000]:
+        return "xml_ss"
+    low = blob[:8192].lower()
+    if b"<html" in low or (b"<table" in low and b"<ss:" not in blob[:3000]):
+        return "html_like"
+    return "unknown"
+
+
+def _dedupe_engines(seq: list[str | None]) -> list[str | None]:
     seen: set[str] = set()
     out: list[str | None] = []
     for e in seq:
-        key = e if e is not None else "__auto__"
-        if key in seen:
+        k = e if e is not None else "__auto__"
+        if k in seen:
             continue
-        seen.add(key)
+        seen.add(k)
         out.append(e)
     return out
 
 
-def open_excel_workbook(path: str) -> tuple[pd.ExcelFile, str | None]:
-    """
-    Открывает книгу, перебирая движки. Не зависит от имени листа — только от файла.
-    """
-    path_s = str(path)
+def engines_for_file(path: str) -> list[str | None]:
+    """Порядок движков с учётом реального типа файла и расширения."""
+    ext = Path(path).suffix.lower()
+    kind = sniff_excel_container(path)
+    seq: list[str | None] = []
+
+    if kind == "zip_ooxml":
+        seq.extend([None, "openpyxl", "calamine"])
+    elif kind == "ole_biff":
+        seq.extend(["xlrd", "calamine"])
+    elif kind == "xml_ss":
+        seq.extend(["calamine", None, "openpyxl", "xlrd"])
+    elif kind == "html_like":
+        seq.extend(["calamine", "xlrd", None, "openpyxl"])
+    else:
+        seq.extend([None, "openpyxl", "calamine", "xlrd"])
+
+    if ext == ".xlsb":
+        seq = ["calamine", None, "openpyxl"] + seq
+    elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        if kind == "ole_biff":
+            seq = ["xlrd", "calamine", None, "openpyxl"] + seq
+    elif ext == ".xls":
+        if kind == "zip_ooxml":
+            seq = [None, "openpyxl", "calamine", "xlrd"] + seq
+        elif kind == "xml_ss":
+            seq = ["calamine", None, "openpyxl", "xlrd"] + seq
+
+    return _dedupe_engines(seq)
+
+
+def _clone_to_tempfile(original: str) -> str:
+    p = Path(original)
+    suf = p.suffix if p.suffix else ".bin"
+    fd, dest = tempfile.mkstemp(prefix="checkokdp_", suffix=suf)
+    os.close(fd)
+    shutil.copyfile(original, dest)
+    return dest
+
+
+def _excel_read_sources(path: str) -> list[tuple[str, bool]]:
+    """Пары (путь, это_временная_копия). Сначала оригинал, затем байтовая копия."""
+    p = str(Path(path).expanduser().resolve(strict=False))
+    out: list[tuple[str, bool]] = [(p, False)]
+    try:
+        out.append((_clone_to_tempfile(p), True))
+    except OSError:
+        pass
+    return out
+
+
+def _cleanup_temp(path: str, is_temp: bool) -> None:
+    if not is_temp:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _open_excel_file(path: str) -> tuple[pd.ExcelFile, str | None]:
     last_exc: Exception | None = None
-    for eng in _engines_to_try(path_s):
+    for eng in engines_for_file(path):
         try:
-            return pd.ExcelFile(path_s, engine=eng), eng
+            return pd.ExcelFile(path, engine=eng), eng
         except Exception as e:
             last_exc = e
     assert last_exc is not None
-    raise ValueError(
-        "Не удалось открыть Excel-файл ни одним доступным способом. "
-        "Попробуйте открыть файл в Excel и «Сохранить как» .xlsx или .xls (97–2003). "
-        f"Последняя ошибка: {last_exc}"
-    ) from last_exc
+    raise last_exc
 
 
-def read_registry_file(path: str) -> pd.DataFrame:
-    """
-    Считывает реестр ОКПД2: данные с 7-й строки файла, колонки «Код» и «Название».
-    Лист выбирается автоматически — первый лист, где после пропуска строк есть эти колонки;
-    имя листа (в т.ч. на русском) не важно.
-    """
-    path_s = str(path)
-    xl, engine = open_excel_workbook(path_s)
-    last_sheet_error: str | None = None
-    for sheet in xl.sheet_names:
+def _read_excel_sheet(path: str, sheet_name: str | int, **kwargs) -> pd.DataFrame:
+    """Читает лист, перебирая движки."""
+    last_exc: Exception | None = None
+    for eng in engines_for_file(path):
         try:
-            df = pd.read_excel(
-                path_s,
-                sheet_name=sheet,
-                skiprows=6,
-                engine=engine,
-            )
+            return pd.read_excel(path, sheet_name=sheet_name, engine=eng, **kwargs)
         except Exception as e:
-            last_sheet_error = f"{sheet!r}: {e}"
+            last_exc = e
+    assert last_exc is not None
+    raise last_exc
+
+
+def open_excel_workbook(path: str) -> tuple[pd.ExcelFile, str | None]:
+    """
+    Открывает книгу. Для чтения реестра и второго файла лучше вызывать
+    read_registry_file / read_code_name_file — там копия файла и запасные пути.
+    """
+    return _open_excel_file(str(Path(path).expanduser().resolve(strict=False)))
+
+
+def _read_html_tables(path: str) -> list[pd.DataFrame]:
+    """HTML-таблицы из «Сохранить как веб-страницу» / поддельного .xls."""
+    raw = Path(path).read_bytes()
+    last_exc: Exception | None = None
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            dfs = pd.read_html(io.StringIO(text))
+            if dfs:
+                return dfs
+        except Exception as e:
+            last_exc = e
+    try:
+        dfs = pd.read_html(path)
+        if dfs:
+            return dfs
+    except Exception as e:
+        last_exc = e
+    assert last_exc is not None
+    raise ValueError(f"Не удалось разобрать как HTML-таблицу: {last_exc}") from last_exc
+
+
+def _registry_from_dataframe(df: pd.DataFrame) -> pd.DataFrame | None:
+    df2 = df.copy()
+    df2.columns = [_coerce_header(c) for c in df2.columns]
+    if "Код" not in df2.columns or "Название" not in df2.columns:
+        return None
+    return df2[["Код", "Название"]].dropna(subset=["Код", "Название"])
+
+
+def _read_registry_from_html(path: str) -> pd.DataFrame:
+    for tbl in _read_html_tables(path):
+        if tbl.empty or tbl.shape[1] < 2:
             continue
-        df.columns = [_coerce_header(c) for c in df.columns]
-        if "Код" not in df.columns or "Название" not in df.columns:
+        hdr_row = min(20, len(tbl) - 1)
+        for header_ix in range(hdr_row + 1):
+            chunk = tbl.iloc[header_ix:].reset_index(drop=True)
+            if chunk.shape[0] < 2:
+                continue
+            cols = [_coerce_header(x) for x in chunk.iloc[0]]
+            body = chunk.iloc[1:].copy()
+            body.columns = cols
+            got = _registry_from_dataframe(body)
+            if got is not None and not got.empty:
+                return got
+        try:
+            df_try = tbl.copy()
+            df_try.columns = [_coerce_header(c) for c in df_try.columns]
+            got = _registry_from_dataframe(df_try)
+            if got is not None and not got.empty:
+                return got
+        except Exception:
             continue
-        return df[["Код", "Название"]].dropna(subset=["Код", "Название"])
+    raise ValueError(
+        "В HTML-таблице не найдены колонки «Код» и «Название». "
+        "Сохраните реестр из Excel как .xlsx или скопируйте лист в новую книгу."
+    )
+
+
+def _read_codename_from_html(path: str) -> pd.DataFrame:
+    for tbl in _read_html_tables(path):
+        if tbl.empty or tbl.shape[1] < 1:
+            continue
+        col0 = tbl.iloc[:, 0]
+        for v in col0:
+            if pd.notna(v) and str(v).strip() != "":
+                return pd.DataFrame({"Value": tbl.iloc[:, 0].copy()})
+    raise ValueError("В HTML не найдена первая колонка с данными «код название».")
+
+
+def _read_registry_from_excel_path(read_path: str) -> pd.DataFrame:
+    xl, preferred_eng = _open_excel_file(read_path)
+    last_sheet_error: str | None = None
+    try:
+        for sheet in xl.sheet_names:
+            try:
+                df = _read_excel_sheet(
+                    read_path, sheet_name=sheet, skiprows=6, header=0
+                )
+            except Exception as e:
+                last_sheet_error = f"{sheet!r}: {e}"
+                continue
+            got = _registry_from_dataframe(df)
+            if got is not None and not got.empty:
+                return got
+            try:
+                df2 = pd.read_excel(
+                    read_path,
+                    sheet_name=sheet,
+                    skiprows=6,
+                    engine=preferred_eng,
+                    header=0,
+                )
+            except Exception:
+                continue
+            got = _registry_from_dataframe(df2)
+            if got is not None and not got.empty:
+                return got
+    finally:
+        try:
+            xl.close()
+        except Exception:
+            pass
 
     hint = f" ({last_sheet_error})" if last_sheet_error else ""
     raise ValueError(
@@ -101,31 +273,106 @@ def read_registry_file(path: str) -> pd.DataFrame:
     )
 
 
-def read_code_name_file(path: str) -> pd.DataFrame:
-    """
-    Второй файл: одна колонка «код название».
-    Берётся первый лист (в порядке книги), где в первой колонке есть непустые ячейки.
-    Название листа не используется. Поддержка разных версий Excel через несколько движков.
-    """
-    path_s = str(path)
-    xl, engine = open_excel_workbook(path_s)
-    for sheet in xl.sheet_names:
+def _read_codename_from_excel_path(read_path: str) -> pd.DataFrame:
+    xl, preferred_eng = _open_excel_file(read_path)
+    try:
+        for sheet in xl.sheet_names:
+            try:
+                raw = _read_excel_sheet(read_path, sheet_name=sheet, header=None)
+            except Exception:
+                try:
+                    raw = pd.read_excel(
+                        read_path,
+                        sheet_name=sheet,
+                        header=None,
+                        engine=preferred_eng,
+                    )
+                except Exception:
+                    continue
+            if raw.empty or raw.shape[1] < 1:
+                continue
+            col0 = raw.iloc[:, 0]
+            for v in col0:
+                if pd.notna(v) and str(v).strip() != "":
+                    return pd.DataFrame({"Value": raw.iloc[:, 0].copy()})
+    finally:
         try:
-            raw = pd.read_excel(
-                path_s, sheet_name=sheet, header=None, engine=engine
-            )
+            xl.close()
         except Exception:
-            continue
-        if raw.empty or raw.shape[1] < 1:
-            continue
-        col0 = raw.iloc[:, 0]
-        for v in col0:
-            if pd.notna(v) and str(v).strip() != "":
-                return pd.DataFrame({"Value": raw.iloc[:, 0].copy()})
-
+            pass
     raise ValueError(
         "Во втором файле не найден лист с непустыми значениями в первой колонке"
     )
+
+
+def _run_with_file_variants(path: str, reader: Callable[[str], pd.DataFrame]) -> pd.DataFrame:
+    """Оригинал и временная копия (часто «лечит» битые OLE/блокировки, как после Save As в Excel)."""
+    agg: list[str] = []
+    for read_path, is_temp in _excel_read_sources(path):
+        try:
+            return reader(read_path)
+        except Exception as e:
+            agg.append(f"{Path(read_path).name}: {e}")
+        finally:
+            _cleanup_temp(read_path, is_temp)
+    raise ValueError(
+        "Не удалось прочитать Excel. Часто помогает открыть файл в Excel и "
+        "«Сохранить как» новый .xlsx. Детали:\n"
+        + "\n".join(agg[:8])
+    )
+
+
+def _file_looks_like_markup(path: str) -> bool:
+    """Не пытаемся гонять read_html по чистому бинарнику (это долго и бессмысленно)."""
+    kind = sniff_excel_container(path)
+    if kind in ("html_like", "xml_ss"):
+        return True
+    blob = _peek_file_head(path, 32768).lower()
+    return b"<table" in blob or b"<html" in blob or b"<?xml" in blob
+
+
+def read_registry_file(path: str) -> pd.DataFrame:
+    """
+    Считывает реестр ОКПД2: данные с 7-й строки файла, колонки «Код» и «Название».
+    Лист выбирается автоматически. Имя листа не важно.
+    Устойчиво к неверному расширению, старым .xls и HTML-выгрузкам.
+    """
+    path_base = str(Path(path).expanduser().resolve(strict=False))
+
+    try:
+        return _run_with_file_variants(path_base, _read_registry_from_excel_path)
+    except Exception as e_excel:
+        html_err: str | None = None
+        if _file_looks_like_markup(path_base):
+            try:
+                return _read_registry_from_html(path_base)
+            except Exception as e_html:
+                html_err = str(e_html)
+        msg = str(e_excel)
+        if html_err:
+            msg += f"\n\nЗапасной разбор HTML/XML: {html_err}"
+        raise ValueError(msg) from e_excel
+
+
+def read_code_name_file(path: str) -> pd.DataFrame:
+    """
+    Второй файл: одна колонка «код название». Лист с данными ищется автоматически.
+    """
+    path_base = str(Path(path).expanduser().resolve(strict=False))
+
+    try:
+        return _run_with_file_variants(path_base, _read_codename_from_excel_path)
+    except Exception as e_excel:
+        html_err: str | None = None
+        if _file_looks_like_markup(path_base):
+            try:
+                return _read_codename_from_html(path_base)
+            except Exception as e_html:
+                html_err = str(e_html)
+        msg = str(e_excel)
+        if html_err:
+            msg += f"\n\nЗапасной разбор HTML: {html_err}"
+        raise ValueError(msg) from e_excel
 
 
 def split_code_name(cell: str) -> Tuple[str, str]:
