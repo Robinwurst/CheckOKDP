@@ -35,29 +35,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QModelIndex, QSize, Qt, QSortFilterProxyModel
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
-from services import (
-    read_registry_file,
-    read_code_name_file,
-    split_code_name,
-    merge_code_with_registry,
-)
-
-
-def _norm_cell_text(value: object) -> str:
-    """Одинаковое сравнение ячеек: схлопываем пробелы по краям и между словами."""
-    return " ".join(str(value).split()).strip()
-
-
-def _value_differs_from_merged(df: pd.DataFrame) -> list[bool]:
-    """True, если исходная ячейка (Value) не совпадает с колонкой «Объединенный»."""
-    if df is None or df.empty:
-        return []
-    if "Value" not in df.columns or "Объединенный" not in df.columns:
-        return [False] * len(df)
-    return [
-        _norm_cell_text(r["Value"]) != _norm_cell_text(r["Объединенный"])
-        for _, r in df.iterrows()
-    ]
+from services import read_registry_file, read_code_name_file, analyze_row
 
 
 class _DiffRowFilterProxy(QSortFilterProxyModel):
@@ -390,8 +368,7 @@ class MainWindow(QMainWindow):
         self.codename_path: str | None = None
         self.registry_df: pd.DataFrame | None = None
         self.codename_df: pd.DataFrame | None = None
-        self._value_merged_diff: list[bool] = []
-        self._registry_miss_rows: list[bool] = []
+        self._row_highlight: list[bool] = []
         self._table_proxy = _DiffRowFilterProxy(self)
 
         self._setup_ui()
@@ -432,7 +409,8 @@ class MainWindow(QMainWindow):
 
         hint = QLabel(
             "Реестр — Excel с колонками «Код» и «Название» (данные с 7-й строки) скачивать на - https://classifikators.ru/okpd "
-            "Второй файл — одна колонка: «код название» через пробел."
+            "Второй файл — одна колонка: «код название» через пробел; лист с данными "
+            "ищется автоматически (имя листа не важно). Поддерживаются .xlsx и .xls."
         )
         hint.setObjectName("AppHint")
         hint.setWordWrap(True)
@@ -541,11 +519,11 @@ class MainWindow(QMainWindow):
         table_layout.addWidget(self.table_view)
 
         nav_hint = QLabel(
-            "Подсветка строк: персиковый фон — колонка «Объединенный» не совпадает с исходной «Value». "
-            "Если кода нет в реестре ОКПД2, в «Объединенный» добавляется текст об этом. "
-            "Фильтр: все строки / только подсвеченные / только без подсветки. "
-            "При сохранении в Excel те же строки без реестра подсвечиваются в файле. "
-            "Колёсико — прокрутка; заголовок колонки — сортировка; Shift/Ctrl — несколько строк."
+            "Подсветка (персиковый): код не найден в реестре; найдено несколько вариантов "
+            "с одинаковой «глубиной» кода; один вариант, но код или наименование в файле "
+            "не совпадают с реестром. Фильтр: все / только подсвеченные / без подсветки. "
+            "При сохранении в Excel подсветка совпадает с таблицей. "
+            "Колёсико — прокрутка; заголовок — сортировка; Shift/Ctrl — несколько строк."
         )
         nav_hint.setObjectName("AppHint")
         nav_hint.setWordWrap(True)
@@ -680,22 +658,19 @@ class MainWindow(QMainWindow):
             self.codename_df = read_code_name_file(self.codename_path)
 
             new_col: list[str] = []
-            miss_row: list[bool] = []
+            highlight: list[bool] = []
             for cell in self.codename_df["Value"]:
-                code, _ = split_code_name(cell)
-                text, in_registry = merge_code_with_registry(code, registry_dict)
+                text, _in_registry, hi = analyze_row(cell, registry_dict)
                 new_col.append(text)
-                miss_row.append(not in_registry)
+                highlight.append(hi)
             self.codename_df["Объединенный"] = new_col
-            self._registry_miss_rows = miss_row
-            self._value_merged_diff = _value_differs_from_merged(self.codename_df)
+            self._row_highlight = highlight
 
             self._show_result()
             self.save_btn.setEnabled(True)
 
         except Exception as exc:
-            self._value_merged_diff = []
-            self._registry_miss_rows = []
+            self._row_highlight = []
             self._table_proxy.setSourceModel(None)
             QMessageBox.critical(
                 self,
@@ -713,7 +688,7 @@ class MainWindow(QMainWindow):
             return
 
         rows, cols = self.codename_df.shape
-        src_flags = self._value_merged_diff
+        src_flags = self._row_highlight
         use_row_colors = len(src_flags) == rows
         if use_row_colors:
             diff_rows = list(src_flags)
@@ -756,7 +731,7 @@ class MainWindow(QMainWindow):
         n_diff = sum(1 for f in diff_rows if f) if use_row_colors else 0
         if use_row_colors:
             self.status_bar.showMessage(
-                f"Строк: {rows}. Отличается от исходника: {n_diff}, совпадает: {rows - n_diff}. "
+                f"Строк: {rows}. Требуют внимания (подсветка): {n_diff}, без подсветки: {rows - n_diff}. "
                 "Сортировка — по заголовку колонки; фильтр — справа от «Результат».",
                 10000,
             )
@@ -773,7 +748,7 @@ class MainWindow(QMainWindow):
         source = self._table_proxy.sourceModel()
         if source is None:
             return
-        if len(self._value_merged_diff) != source.rowCount():
+        if len(self._row_highlight) != source.rowCount():
             self._table_proxy.set_filter_mode("all")
             return
         mode = self._result_filter.currentData()
@@ -798,19 +773,19 @@ class MainWindow(QMainWindow):
             sheet_name = "Sheet1"
             n_rows_df = len(self.codename_df)
             n_cols = self.codename_df.shape[1]
-            miss = self._registry_miss_rows
+            hi = self._row_highlight
 
             with pd.ExcelWriter(path_p, engine="openpyxl") as writer:
                 self.codename_df.to_excel(
                     writer, index=False, sheet_name=sheet_name
                 )
-                if len(miss) == n_rows_df and any(miss):
+                if len(hi) == n_rows_df and any(hi):
                     ws = writer.sheets[sheet_name]
                     row_fill = PatternFill(
                         fill_type="solid", fgColor="FFF3E0"
                     )
-                    for i, is_miss in enumerate(miss):
-                        if not is_miss:
+                    for i, need_hi in enumerate(hi):
+                        if not need_hi:
                             continue
                         excel_row = i + 2
                         for c in range(1, n_cols + 1):
@@ -820,8 +795,8 @@ class MainWindow(QMainWindow):
                 self,
                 "Готово",
                 f"Результат сохранён: {path}\n\n"
-                "Строки, где код не найден в реестре ОКПД2, в файле выделены цветом "
-                "(как в таблице в программе).",
+                "Подсвеченные в файле строки совпадают с таблицей: нет в реестре, "
+                "несколько совпадений, либо расхождение кода/наименования с реестром.",
             )
             self.status_bar.showMessage(f"Сохранено: {path}", 5000)
         except Exception as exc:
