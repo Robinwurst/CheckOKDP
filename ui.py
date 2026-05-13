@@ -408,9 +408,10 @@ class MainWindow(QMainWindow):
         hero_layout.addWidget(title)
 
         hint = QLabel(
-            "Реестр — Excel с колонками «Код» и «Название» (данные с 7-й строки) скачивать на - https://classifikators.ru/okpd "
+            "Реестр — Excel с колонками «Код» и «Название» (шапка с 7-й строки; лист с данными "
+            "определяется автоматически, имя листа не важно). Скачивать: https://classifikators.ru/okpd "
             "Второй файл — одна колонка: «код название» через пробел; лист с данными "
-            "ищется автоматически (имя листа не важно). Поддерживаются .xlsx и .xls."
+            "ищется автоматически. Поддерживаются .xlsx, .xls, .xlsm, .xlsb."
         )
         hint.setObjectName("AppHint")
         hint.setWordWrap(True)
@@ -625,7 +626,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------------
     def _browse_registry(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите файл реестра", "", "Excel файлы (*.xlsx *.xls)"
+            self, "Выберите файл реестра", "", "Excel (*.xlsx *.xls *.xlsm *.xlsb)"
         )
         if path:
             self.registry_path = path
@@ -633,7 +634,7 @@ class MainWindow(QMainWindow):
 
     def _browse_codename(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите файл код+название", "", "Excel файлы (*.xlsx *.xls)"
+            self, "Выберите файл код+название", "", "Excel (*.xlsx *.xls *.xlsm *.xlsb)"
         )
         if path:
             self.codename_path = path

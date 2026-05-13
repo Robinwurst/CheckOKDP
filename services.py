@@ -17,54 +17,115 @@ def norm_cell_text(value: object) -> str:
     return " ".join(str(value).split()).strip()
 
 
-def _excel_read_engine(path: str) -> str | None:
-    """Для старых .xls pandas требует движок xlrd."""
-    if Path(path).suffix.lower() == ".xls":
-        return "xlrd"
-    return None
+def _coerce_header(val: object) -> str:
+    """Убираем неразрывные пробелы и лишние пробелы в названиях колонок."""
+    return " ".join(str(val).replace("\u00a0", " ").split()).strip()
 
 
-def read_registry_file(path: str, sheet_index: int = 0) -> pd.DataFrame:
+def _engines_to_try(path: str) -> list[str | None]:
     """
-    Считывает реестр OKDP2 из Excel‑файла, начиная с 7‑й строки.
-    Ожидает, что в файле присутствуют колонки «Код» и «Название».
+    Порядок движков чтения: сначала типичный для расширения, затем запасной.
+    calamine (Rust) часто открывает старые .xls/.xlsx, с которыми xlrd/openpyxl падают.
     """
-    engine = _excel_read_engine(path)
-    df = pd.read_excel(path, sheet_name=sheet_index, skiprows=6, engine=engine)
-    df.columns = [c.strip() for c in df.columns]
-    if "Код" not in df.columns or "Название" not in df.columns:
-        raise ValueError("Файл реестра должен содержать колонки 'Код' и 'Название'")
-    return df[["Код", "Название"]].dropna(subset=["Код", "Название"])
+    ext = Path(path).suffix.lower()
+    seq: list[str | None]
+    if ext == ".xls":
+        seq = ["xlrd", "calamine"]
+    elif ext == ".xlsb":
+        seq = ["calamine"]
+    elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        seq = [None, "openpyxl", "calamine"]
+    else:
+        seq = [None, "openpyxl", "calamine", "xlrd"]
+
+    seen: set[str] = set()
+    out: list[str | None] = []
+    for e in seq:
+        key = e if e is not None else "__auto__"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+def open_excel_workbook(path: str) -> tuple[pd.ExcelFile, str | None]:
+    """
+    Открывает книгу, перебирая движки. Не зависит от имени листа — только от файла.
+    """
+    path_s = str(path)
+    last_exc: Exception | None = None
+    for eng in _engines_to_try(path_s):
+        try:
+            return pd.ExcelFile(path_s, engine=eng), eng
+        except Exception as e:
+            last_exc = e
+    assert last_exc is not None
+    raise ValueError(
+        "Не удалось открыть Excel-файл ни одним доступным способом. "
+        "Попробуйте открыть файл в Excel и «Сохранить как» .xlsx или .xls (97–2003). "
+        f"Последняя ошибка: {last_exc}"
+    ) from last_exc
+
+
+def read_registry_file(path: str) -> pd.DataFrame:
+    """
+    Считывает реестр ОКПД2: данные с 7-й строки файла, колонки «Код» и «Название».
+    Лист выбирается автоматически — первый лист, где после пропуска строк есть эти колонки;
+    имя листа (в т.ч. на русском) не важно.
+    """
+    path_s = str(path)
+    xl, engine = open_excel_workbook(path_s)
+    last_sheet_error: str | None = None
+    for sheet in xl.sheet_names:
+        try:
+            df = pd.read_excel(
+                path_s,
+                sheet_name=sheet,
+                skiprows=6,
+                engine=engine,
+            )
+        except Exception as e:
+            last_sheet_error = f"{sheet!r}: {e}"
+            continue
+        df.columns = [_coerce_header(c) for c in df.columns]
+        if "Код" not in df.columns or "Название" not in df.columns:
+            continue
+        return df[["Код", "Название"]].dropna(subset=["Код", "Название"])
+
+    hint = f" ({last_sheet_error})" if last_sheet_error else ""
+    raise ValueError(
+        "В реестре не найден лист с колонками «Код» и «Название» "
+        "(шапка таблицы ожидается с 7-й строки файла, как в выгрузке classifikators.ru)."
+        f"{hint}"
+    )
 
 
 def read_code_name_file(path: str) -> pd.DataFrame:
     """
-    Считывает второй файл, где в одной ячейке находится объединённый код+название.
-    Создаётся DataFrame с одной колонкой «Value».
-    Лист выбирается по содержимому (первый лист, где в 1-й колонке есть непустые
-    ячейки), без привязки к названию листа. Поддерживаются .xlsx и .xls.
+    Второй файл: одна колонка «код название».
+    Берётся первый лист (в порядке книги), где в первой колонке есть непустые ячейки.
+    Название листа не используется. Поддержка разных версий Excel через несколько движков.
     """
     path_s = str(path)
-    engine = _excel_read_engine(path_s)
-    xl_file = pd.ExcelFile(path_s, engine=engine)
-    df: pd.DataFrame | None = None
-    for sheet_name in xl_file.sheet_names:
-        raw = pd.read_excel(path_s, sheet_name=sheet_name, header=None, engine=engine)
+    xl, engine = open_excel_workbook(path_s)
+    for sheet in xl.sheet_names:
+        try:
+            raw = pd.read_excel(
+                path_s, sheet_name=sheet, header=None, engine=engine
+            )
+        except Exception:
+            continue
         if raw.empty or raw.shape[1] < 1:
             continue
         col0 = raw.iloc[:, 0]
         for v in col0:
             if pd.notna(v) and str(v).strip() != "":
-                df = raw
-                break
-        if df is not None:
-            break
-    if df is None:
-        raise ValueError(
-            "Во втором файле не найден лист с непустыми значениями в первой колонке"
-        )
-    out = pd.DataFrame({"Value": df.iloc[:, 0].copy()})
-    return out
+                return pd.DataFrame({"Value": raw.iloc[:, 0].copy()})
+
+    raise ValueError(
+        "Во втором файле не найден лист с непустыми значениями в первой колонке"
+    )
 
 
 def split_code_name(cell: str) -> Tuple[str, str]:

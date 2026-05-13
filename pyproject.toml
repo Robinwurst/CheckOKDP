@@ -8,4 +8,5 @@ dependencies = [
     "pyside6>=6.11.0",
     "openpyxl>=3.1",
     "xlrd>=2.0.1",
+    "python-calamine>=0.2.3",
 ]
